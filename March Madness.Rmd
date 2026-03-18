@@ -1,0 +1,907 @@
+---
+title: "March Madness"
+author: "Payton Lyons"
+date: "2026-03-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(caret)
+library(nnet)
+library(randomForest)
+library(gbm)
+library(pROC)
+```
+
+# Data Merging and Cleaning
+
+```{r}
+dfaway <- read.csv("~/Desktop/March Madness 2026/Barttorvik Away.csv")
+dfhome <- read.csv("~/Desktop/March Madness 2026/Barttorvik Home.csv")
+dfneutral <- read.csv("~/Desktop/March Madness 2026/Barttorvik Neutral.csv")
+matchups <- read.csv("~/Desktop/March Madness 2026/Tournament Matchups.csv")
+```
+
+```{r}
+#Organize into one row for each matchup
+home <- matchups[seq(1, nrow(matchups), 2), ]
+away <- matchups[seq(2, nrow(matchups), 2), ]
+
+games <- data.frame(
+  year = home$YEAR,
+  round = home$CURRENT.ROUND,
+  team1 = home$TEAM,
+  seed1 = home$SEED,
+  score1 = home$SCORE,
+  team2 = away$TEAM,
+  seed2 = away$SEED,
+  score2 = away$SCORE,
+  winner = ifelse(home$SCORE > away$SCORE, home$TEAM, away$TEAM)
+)
+```
+
+# Logistic Regression
+
+Using only games at either an away or neutral location.
+
+```{r}
+away_neutral <- read.csv("~/Desktop/March Madness 2026/Barttorvik Away-Neutral.csv")
+
+model_df <- games %>%
+  left_join(away_neutral, by = c("team1" = "TEAM", "year" = "YEAR")) %>%
+  rename_with(~ paste0(.x, "_t1"), .cols = -c(year, round, team1, seed1, score1, team2, seed2, score2, winner))
+
+# join barttorvik stats for team2
+model_df <- model_df %>%
+  left_join(away_neutral, by = c("team2" = "TEAM", "year" = "YEAR")) %>%
+  rename_with(~ paste0(.x, "_t2"), .cols = -c(year, round, team1, seed1, score1, team2, seed2, score2, winner, ends_with("_t1")))
+```
+
+```{r,results='hide',message=FALSE,warning=FALSE}
+model_df <- model_df %>%
+  mutate(
+    # key efficiency metrics
+    badj_o_diff = as.numeric(BADJ.O_t1) - as.numeric(BADJ.O_t2),
+    badj_d_diff = as.numeric(BADJ.D_t1) - as.numeric(BADJ.D_t2),
+    
+    # other
+    wab_diff = as.numeric(WAB_t1) - as.numeric(WAB_t2),
+    elite_sos_diff = as.numeric(ELITE.SOS_t1) - as.numeric(ELITE.SOS_t2),
+    exp_diff = as.numeric(EXP_t1) - as.numeric(EXP_t2),
+    talent_diff = as.numeric(TALENT_t1) - as.numeric(TALENT_t2),
+    eff_hgt_diff = as.numeric(EFF.HGT_t1) - as.numeric(EFF.HGT_t2),
+    seed_diff = seed1 - seed2,
+    
+    # outcome variable
+    outcome = ifelse(winner == team1, 1, 0)
+  )
+
+model_df_clean <- na.omit(model_df)
+```
+
+```{r}
+model_df_train <- model_df_clean %>%
+  filter(year < 2025)
+
+model_df_test <- model_df_clean %>%
+  filter(year >= 2025)
+
+model_df_train$outcome <- factor(model_df_train$outcome, levels = c(0, 1), labels = c("loss", "win"))
+model_df_test$outcome <- factor(model_df_test$outcome, levels = c(0, 1), labels = c("loss", "win"))
+
+model_df_clean$outcome <- factor(model_df_clean$outcome, levels = c(0, 1), labels = c("loss", "win"))
+
+```
+
+```{r}
+model <- glm(outcome ~ badj_o_diff+badj_d_diff+wab_diff+elite_sos_diff+
+             exp_diff+talent_diff+eff_hgt_diff+seed_diff, data = model_df_train, 
+             family = binomial)
+summary(model)
+```
+
+```{r}
+predictions <- predict(model, newdata = model_df_test, type = "response")
+
+predicted_outcome <- ifelse(predictions > 0.45, "win", "loss")
+
+# compare to actual outcomes
+actual_outcome <- model_df_test$outcome
+
+# accuracy
+mean(predicted_outcome == actual_outcome)
+
+table(predicted = predicted_outcome, actual = actual_outcome)
+```
+
+```{r,results = 'hide'}
+lmMod <- glm(outcome ~ badj_o_diff+badj_d_diff+wab_diff+elite_sos_diff+
+             exp_diff+talent_diff+eff_hgt_diff+seed_diff, data = model_df_train, 
+             family = binomial)
+selectedMod <- step(lmMod)
+```
+
+```{r}
+summary(selectedMod)
+```
+
+```{r}
+predictions_glm <- predict(selectedMod, newdata = model_df_test, type = "response")
+
+predicted_outcome_glm <- ifelse(predictions_glm > 0.5, "win", "loss")
+
+# compare to actual outcomes
+actual_outcome <- model_df_test$outcome
+
+# accuracy
+mean(predicted_outcome_glm == actual_outcome)
+
+table(predicted = predicted_outcome_glm, actual = actual_outcome)
+```
+
+```{r}
+data.frame(probability = predictions_glm, outcome = model_df_test$outcome) %>%
+  ggplot(aes(x = probability, fill = outcome)) +
+  geom_histogram(bins = 30, alpha = 0.6, position = "identity") +
+  scale_fill_manual(values = c("loss" = "coral", "win" = "steelblue")) +
+  labs(title = "Predicted Win Probability by Actual Outcome",
+       x = "Predicted Win Probability", y = "Count", fill = "Actual") +
+  geom_vline(xintercept = 0.5,linetype="dashed")+
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
+```
+
+```{r}
+roc_curve <- roc(as.numeric(model_df_test$outcome), predictions)
+
+ggroc(roc_curve, color = "steelblue", linewidth = 1) +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "grey50") +
+  labs(title = "ROC Curve — Logistic Regression",
+       subtitle = paste("AUC =", round(auc(roc_curve), 3)),
+       x = "Specificity", y = "Sensitivity") +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
+```
+
+```{r}
+data.frame(probability = predictions, outcome = as.numeric(model_df_test$outcome) - 1) %>%
+  mutate(bin = cut(probability, breaks = seq(0, 1, by = 0.1))) %>%
+  group_by(bin) %>%
+  summarise(mean_pred = mean(probability),
+            mean_actual = mean(outcome),
+            n = n()) %>%
+  ggplot(aes(x = mean_pred, y = mean_actual)) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  geom_point(aes(size = n), color = "steelblue", alpha = 0.8) +
+  scale_size_continuous(range = c(2, 8)) +
+  labs(title = "Calibration Plot",
+       subtitle = "Points on diagonal = perfectly calibrated",
+       x = "Mean Predicted Probability",
+       y = "Actual Win Rate",
+       size = "Games") +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
+```
+
+```{r}
+grid <- expand.grid(
+  badj_o_diff = seq(min(model_df_test$badj_o_diff), 
+                    max(model_df_test$badj_o_diff), length = 100),
+  badj_d_diff = seq(min(model_df_test$badj_d_diff), 
+                    max(model_df_test$badj_d_diff), length = 100)
+)
+
+grid$wab_diff     <- mean(model_df_test$wab_diff)
+grid$talent_diff  <- mean(model_df_test$talent_diff)
+
+
+# logistic regression uses type = "response" and returns probabilities
+# so convert using your optimal threshold
+grid$pred <- ifelse(predict(selectedMod, newdata = grid, type = "response") > 0.50, 
+                    "win", "loss")
+grid$pred <- factor(grid$pred, levels = c("loss", "win"))
+
+ggplot() +
+  geom_tile(data = grid, aes(x = badj_o_diff, y = badj_d_diff, fill = pred),
+            alpha = 0.3) +
+  geom_point(data = model_df_test,
+             aes(x = badj_o_diff, y = badj_d_diff, color = outcome),
+             size = 2) +
+  scale_fill_manual(values = c("loss" = "coral", "win" = "lightgreen")) +
+  scale_color_manual(values = c("loss" = "darkred", "win" = "forestgreen")) +
+  labs(title = "Logistic Regression Decision Boundary",
+       subtitle = "Other variables held at mean",
+       x = "Offensive Efficiency Diff",
+       y = "Defensive Efficiency Diff",
+       fill = "Predicted", color = "Actual") +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
+```
+
+
+# KNN Algorithm
+
+Plan is to test this with both home and neutral/away data.
+
+```{r, results='hide'}
+trainControl <- trainControl(method="repeatedcv", number=20, repeats=3)
+metric <- "Accuracy"
+
+set.seed(7)
+grid <- expand.grid(.k=seq(1,15,by=1))
+fit.knn <- train(outcome~badj_o_diff+badj_d_diff+wab_diff+talent_diff, data=model_df_train,
+             method="knn", metric=metric,tuneGrid=grid ,trControl=trainControl,
+             preProcess = c("center", "scale"))
+knn.k1 <- fit.knn$bestTune 
+print(fit.knn)
+```
+
+```{r}
+plot(fit.knn)
+```
+
+```{r}
+set.seed(7)
+prediction <- predict(fit.knn, newdata = model_df_test)
+cf <- confusionMatrix(prediction, model_df_test$outcome)
+print(cf)
+```
+
+```{r}
+# create a grid of values spanning your two key variables
+grid <- expand.grid(
+  badj_o_diff = seq(min(model_df_test$badj_o_diff), 
+                    max(model_df_test$badj_o_diff), length = 100),
+  badj_d_diff = seq(min(model_df_test$badj_d_diff), 
+                    max(model_df_test$badj_d_diff), length = 100)
+)
+
+# set other variables to their mean
+grid$wab_diff     <- mean(model_df_test$wab_diff)
+grid$talent_diff  <- mean(model_df_test$talent_diff)
+grid$seed_diff    <- mean(model_df_test$seed_diff)
+grid$exp_diff     <- mean(model_df_test$exp_diff)
+grid$eff_hgt_diff <- mean(model_df_test$eff_hgt_diff)
+
+grid$pred <- predict(fit.knn, newdata = grid)
+
+ggplot() +
+  geom_tile(data = grid, aes(x = badj_o_diff, y = badj_d_diff, fill = pred), 
+            alpha = 0.3) +
+  geom_point(data = model_df_test, 
+             aes(x = badj_o_diff, y = badj_d_diff, color = outcome),
+             size = 2) +
+  scale_fill_manual(values = c("loss" = "coral", "win" = "lightgreen")) +
+  scale_color_manual(values = c("loss" = "darkred", "win" = "forestgreen")) +
+  labs(title = "KNN Decision Boundary",
+       subtitle = "Other variables held at mean",
+       x = "Offensive Efficiency Diff",
+       y = "Defensive Efficiency Diff",
+       fill = "Predicted", color = "Actual") +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
+```
+
+```{r}
+# create a grid of values spanning your two key variables
+grid <- expand.grid(
+  wab_diff = seq(min(model_df_test$wab_diff), 
+                    max(model_df_test$wab_diff), length = 100),
+  talent_diff = seq(min(model_df_test$talent_diff), 
+                    max(model_df_test$talent_diff), length = 100)
+)
+
+# set other variables to their mean
+grid$badj_o_diff <- mean(model_df_test$badj_o_diff)
+grid$badj_d_diff <- mean(model_df_test$badj_d_diff)
+
+grid$pred <- predict(fit.knn, newdata = grid)
+
+ggplot() +
+  geom_tile(data = grid, aes(x = wab_diff, y = talent_diff, fill = pred), 
+            alpha = 0.3) +
+  geom_point(data = model_df_test, 
+             aes(x = wab_diff, y = talent_diff, color = outcome),
+             size = 2) +
+  scale_fill_manual(values = c("loss" = "coral", "win" = "lightgreen")) +
+  scale_color_manual(values = c("loss" = "darkred", "win" = "forestgreen")) +
+  labs(title = "KNN Decision Boundary",
+       subtitle = "Other variables held at mean",
+       x = "Wins Above Bubble Diff",
+       y = "Talent Rating Diff",
+       fill = "Predicted", color = "Actual") +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
+```
+
+# Neural Network(do more research)
+
+```{r,results='hide'}
+nnet_grid <- expand.grid(size = c(1,2,3,4,5),
+                         decay = c(0.001, 0.01, 0.1))
+
+fit.nnet <- train(outcome~badj_o_diff+badj_d_diff+wab_diff+talent_diff, 
+                  data = model_df_train, method ="nnet",
+                  metric = metric, trControl = trainControl,
+                  preProcess = c("center", "scale"),
+                  tuneGrid = nnet_grid,maxit=500)
+```
+
+```{r}
+plot(fit.nnet)
+```
+
+```{r}
+grid <- expand.grid(
+  badj_o_diff = seq(min(model_df_test$badj_o_diff), 
+                    max(model_df_test$badj_o_diff), length = 100),
+  badj_d_diff = seq(min(model_df_test$badj_d_diff), 
+                    max(model_df_test$badj_d_diff), length = 100)
+)
+
+grid$wab_diff     <- mean(model_df_test$wab_diff)
+grid$talent_diff  <- mean(model_df_test$talent_diff)
+
+
+# logistic regression uses type = "response" and returns probabilities
+# so convert using your optimal threshold
+grid$pred <- predict(fit.nnet, newdata = grid)
+
+ggplot() +
+  geom_tile(data = grid, aes(x = badj_o_diff, y = badj_d_diff, fill = pred),
+            alpha = 0.3) +
+  geom_point(data = model_df_test,
+             aes(x = badj_o_diff, y = badj_d_diff, color = outcome),
+             size = 2) +
+  scale_fill_manual(values = c("loss" = "coral", "win" = "lightgreen")) +
+  scale_color_manual(values = c("loss" = "darkred", "win" = "forestgreen")) +
+  labs(title = "Neural Network Decision Boundary",
+       subtitle = "Other variables held at mean",
+       x = "Offensive Efficiency Diff",
+       y = "Defensive Efficiency Diff",
+       fill = "Predicted", color = "Actual") +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
+```
+
+# Random Forest
+```{r,results='hide'}
+fit.rf <- train(outcome~badj_o_diff+badj_d_diff+wab_diff+talent_diff, 
+                data = model_df_train, 
+             method = "rf", metric = metric,trControl = trainControl,
+             preProcess = c("center", "scale"),ntree=500)
+```
+
+```{r}
+prediction_rf <- predict(fit.rf, newdata = model_df_test)
+confusionMatrix(prediction_rf, model_df_test$outcome)
+```
+```{r}
+grid <- expand.grid(
+  badj_o_diff = seq(min(model_df_test$badj_o_diff), 
+                    max(model_df_test$badj_o_diff), length = 100),
+  badj_d_diff = seq(min(model_df_test$badj_d_diff), 
+                    max(model_df_test$badj_d_diff), length = 100)
+)
+
+grid$wab_diff     <- mean(model_df_test$wab_diff)
+grid$talent_diff  <- mean(model_df_test$talent_diff)
+
+
+# logistic regression uses type = "response" and returns probabilities
+# so convert using your optimal threshold
+grid$pred <- predict(fit.rf, newdata = grid)
+
+ggplot() +
+  geom_tile(data = grid, aes(x = badj_o_diff, y = badj_d_diff, fill = pred),
+            alpha = 0.3) +
+  geom_point(data = model_df_test,
+             aes(x = badj_o_diff, y = badj_d_diff, color = outcome),
+             size = 2) +
+  scale_fill_manual(values = c("loss" = "coral", "win" = "lightgreen")) +
+  scale_color_manual(values = c("loss" = "darkred", "win" = "forestgreen")) +
+  labs(title = "Random Forest Decision Boundary",
+       subtitle = "Other variables held at mean",
+       x = "Offensive Efficiency Diff",
+       y = "Defensive Efficiency Diff",
+       fill = "Predicted", color = "Actual") +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
+```
+
+# Gradient Boosting
+```{r,results='hide'}
+fit.gbm <- train(outcome ~badj_o_diff+badj_d_diff+wab_diff+talent_diff, 
+             data = model_df_train, method = "gbm", metric = metric, 
+             trControl = trainControl, preProcess = c("center", "scale"))
+```
+
+```{r}
+prediction_gbm <- predict(fit.gbm, newdata = model_df_test)
+confusionMatrix(prediction_gbm, model_df_test$outcome)
+```
+
+```{r}
+grid <- expand.grid(
+  badj_o_diff = seq(min(model_df_test$badj_o_diff), 
+                    max(model_df_test$badj_o_diff), length = 100),
+  badj_d_diff = seq(min(model_df_test$badj_d_diff), 
+                    max(model_df_test$badj_d_diff), length = 100)
+)
+
+grid$wab_diff     <- mean(model_df_test$wab_diff)
+grid$talent_diff  <- mean(model_df_test$talent_diff)
+
+
+# logistic regression uses type = "response" and returns probabilities
+# so convert using your optimal threshold
+grid$pred <- predict(fit.gbm, newdata = grid)
+
+ggplot() +
+  geom_tile(data = grid, aes(x = badj_o_diff, y = badj_d_diff, fill = pred),
+            alpha = 0.3) +
+  geom_point(data = model_df_test,
+             aes(x = badj_o_diff, y = badj_d_diff, color = outcome),
+             size = 2) +
+  scale_fill_manual(values = c("loss" = "coral", "win" = "lightgreen")) +
+  scale_color_manual(values = c("loss" = "darkred", "win" = "forestgreen")) +
+  labs(title = "Gradient Boosting Method Decision Boundary",
+       subtitle = "Other variables held at mean",
+       x = "Offensive Efficiency Diff",
+       y = "Defensive Efficiency Diff",
+       fill = "Predicted", color = "Actual") +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
+```
+# Summary and Model Selection
+
+Selected the reduced logistic regression to create tournament bracket.
+
+# 2026 Bracket Predictions
+
+```{r}
+bracket_model <- glm(outcome ~ badj_o_diff+badj_d_diff+wab_diff+talent_diff, 
+                     data = model_df, family = binomial)
+summary(bracket_model)
+```
+
+```{r}
+df_26 <- away_neutral %>%
+  filter(YEAR == 2026) %>%
+  select(c("TEAM","BADJ.O","BADJ.D","WAB","TALENT"))
+```
+## Logistic Regression Predictions
+
+```{r}
+predict_game_lm <- function(team1, team2) {
+  teams <- c(team1, team2)
+  game <- df_26 %>% filter(TEAM %in% teams)
+  game_df <- game[game$TEAM == team1, 2:5] - game[game$TEAM == team2, 2:5]
+  colnames(game_df) <- c("badj_o_diff", "badj_d_diff", "wab_diff", "talent_diff")
+  prob <- predict(bracket_model, newdata = game_df, type = "response")
+  winner <- ifelse(prob > 0.5, team1, team2)
+  win_prob <- round(ifelse(prob > 0.5, prob, 1 - prob) * 100, 1)
+  cat(team1, "vs", team2, "-->", winner, "(", win_prob, "%)\n")
+}
+
+# enter all first round matchups
+matchups <- list(
+  c("Duke", "Siena"),
+  c("Ohio St.", "TCU"),
+  c("St. John's", "Northern Iowa"),
+  c("Kansas", "Cal Baptist"),
+  c("Louisville", "South Florida"),
+  c("Michigan St.", "North Dakota St."),
+  c("UCLA", "UCF"),
+  c("Connecticut", "Furman"),
+  c("Florida", "Prairie View A&M"),
+  c("Clemson", "Iowa"),
+  c("Vanderbilt", "McNeese St."),
+  c("Nebraska", "Troy"),
+  c("North Carolina", "VCU"),
+  c("Illinois", "Penn"),
+  c("Saint Mary's", "Texas A&M"),
+  c("Houston", "Idaho"),
+  c("Arizona", "LIU Brooklyn"),
+  c("Villanova", "Utah St."),
+  c("Wisconsin", "High Point"),
+  c("Arkansas", "Hawaii"),
+  c("BYU", "Texas"),
+  c("Gonzaga", "Kennesaw St."),
+  c("Miami FL", "Missouri"),
+  c("Purdue", "Queens"),
+  c("Michigan", "Howard"),
+  c("Georgia", "Saint Louis"),
+  c("Texas Tech", "Akron"),
+  c("Alabama", "Hofstra"),
+  c("Tennessee", "Miami OH"),
+  c("Virginia", "Wright St."),
+  c("Kentucky", "Santa Clara"),
+  c("Iowa St.", "Tennessee St.")
+  
+)
+```
+#### Round 1
+```{r}
+# run all predictions at once
+cat("=== First Round Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_lm(m[1], m[2])))
+```
+#### Round 2
+
+```{r}
+matchups <- list(
+  c("Duke", "Ohio St."),
+  c("Kansas", "St. John's"),
+  c("Michigan St.", "Louisville"),
+  c("Connecticut", "UCLA"),
+  c("Florida", "Clemson"),
+  c("Nebraska", "Vanderbilt"),
+  c("Illinois", "VCU"),
+  c("Houston", "Texas A&M"),
+  c("Arizona", "Villanova"),
+  c("Arkansas", "Wisconsin"),
+  c("Gonzaga", "BYU"),
+  c("Purdue", "Miami FL"),
+  c("Michigan", "Georgia"),
+  c("Alabama", "Texas Tech"),
+  c("Virginia", "Tennessee"),
+  c("Iowa St.", "Kentucky")
+)
+
+cat("=== Second Round Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_lm(m[1], m[2])))
+```
+
+#### Sweet 16
+
+```{r}
+matchups <- list(
+  c("Duke", "St. John's"),
+  c("Michigan St.", "Connecticut"),
+  c("Florida", "Vanderbilt"),
+  c("Houston", "Illinois"),
+  c("Arizona", "Arkansas"),
+  c("Purdue", "Gonzaga"),
+  c("Michigan", "Alabama"),
+  c("Iowa St.", "Virginia")
+)
+
+cat("=== Sweet 16 Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_lm(m[1], m[2])))
+```
+
+#### Elite 8
+
+```{r}
+matchups <- list(
+  c("Duke", "Connecticut"),
+  c("Florida", "Houston"),
+  c("Arizona", "Purdue"),
+  c("Michigan", "Virginia")
+)
+
+cat("=== Sweet 16 Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_lm(m[1], m[2])))
+```
+
+#### Semi-Finals
+
+```{r}
+matchups <- list(
+  c("Duke", "Houston"),
+  c("Houston", "Duke"),
+  c("Arizona", "Michigan"),
+  c("Michigan", "Arizona")
+)
+
+cat("=== Semifinal Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_lm(m[1], m[2])))
+```
+#### Finals
+
+```{r}
+matchups <- list(
+  c("Duke", "Michigan"),
+  c("Michigan", "Duke")
+)
+
+cat("=== Final Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_lm(m[1], m[2])))
+```
+
+## Random Forest Predictions (PnzvWL)
+```{r, results = 'hide'}
+modelrf <- train(outcome~badj_o_diff+badj_d_diff+wab_diff+talent_diff, 
+                data = model_df_clean, 
+             method = "rf", metric = metric,trControl = trainControl,
+             preProcess = c("center", "scale"),ntree=500)
+                  
+predict_game_rf <- function(team1, team2) {
+  teams <- c(team1, team2)
+  game <- df_26 %>% filter(TEAM %in% teams)
+  game_df <- game[game$TEAM == team1, 2:5] - game[game$TEAM == team2, 2:5]
+  colnames(game_df) <- c("badj_o_diff", "badj_d_diff", "wab_diff", "talent_diff")
+  prob <- predict(modelrf, newdata = game_df, type = "prob")[,2]
+  winner <- ifelse(prob > 0.5, team1, team2)
+  win_prob <- round(ifelse(prob > 0.5, prob, 1 - prob) * 100, 1)
+  cat(team1, "vs", team2, "-->", winner, "(", win_prob, "%)\n")
+}
+```
+#### Round 1
+```{r}
+matchups <- list(
+  c("Duke", "Siena"),
+  c("Ohio St.", "TCU"),
+  c("St. John's", "Northern Iowa"),
+  c("Kansas", "Cal Baptist"),
+  c("Louisville", "South Florida"),
+  c("Michigan St.", "North Dakota St."),
+  c("UCLA", "UCF"),
+  c("Connecticut", "Furman"),
+  c("Florida", "Prairie View A&M"),
+  c("Clemson", "Iowa"),
+  c("Vanderbilt", "McNeese St."),
+  c("Nebraska", "Troy"),
+  c("North Carolina", "VCU"),
+  c("Illinois", "Penn"),
+  c("Saint Mary's", "Texas A&M"),
+  c("Houston", "Idaho"),
+  c("Arizona", "LIU Brooklyn"),
+  c("Villanova", "Utah St."),
+  c("Wisconsin", "High Point"),
+  c("Arkansas", "Hawaii"),
+  c("BYU", "Texas"),
+  c("Gonzaga", "Kennesaw St."),
+  c("Miami FL", "Missouri"),
+  c("Purdue", "Queens"),
+  c("Michigan", "Howard"),
+  c("Georgia", "Saint Louis"),
+  c("Texas Tech", "Akron"),
+  c("Alabama", "Hofstra"),
+  c("Tennessee", "Miami OH"),
+  c("Virginia", "Wright St."),
+  c("Kentucky", "Santa Clara"),
+  c("Iowa St.", "Tennessee St.")
+  
+)
+
+cat("=== First Round Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_rf(m[1], m[2])))
+```
+#### Round 2
+```{r}
+matchups <- list(
+  c("Duke", "Ohio St."),
+  c("Kansas", "St. John's"),
+  c("Michigan St.", "Louisville"),
+  c("Connecticut", "UCLA"),
+  c("Florida", "Clemson"),
+  c("Nebraska", "Vanderbilt"),
+  c("Illinois", "VCU"),
+  c("Houston", "Saint Mary's"),
+  c("Arizona", "Villanova"),
+  c("Arkansas", "Wisconsin"),
+  c("Gonzaga", "BYU"),
+  c("Purdue", "Miami FL"),
+  c("Michigan", "Georgia"),
+  c("Alabama", "Texas Tech"),
+  c("Virginia", "Tennessee"),
+  c("Iowa St.", "Kentucky")
+)
+
+cat("=== Second Round Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_rf(m[1], m[2])))
+```
+#### Sweet 16
+
+```{r}
+matchups <- list(
+  c("Duke", "St. John's"),
+  c("Connecticut", "Michigan"),
+  c("Florida", "Vanderbilt"),
+  c("Houston", "Illinois"),
+  c("Arizona", "Arkansas"),
+  c("Purdue", "Gonzaga"),
+  c("Michigan", "Alabama"),
+  c("Iowa St.", "Tennessee")
+)
+
+cat("=== Sweet 16 Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_rf(m[1], m[2])))
+```
+
+#### Elite 8
+
+```{r}
+matchups <- list(
+  c("Duke", "Connecticut"),
+  c("Vanderbilt", "Illinois"),
+  c("Arizona", "Purdue"),
+  c("Michigan", "Virginia")
+)
+
+cat("=== Sweet 16 Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_rf(m[1], m[2])))
+```
+
+#### Semi-Finals
+Predict each game twice, one with each team being the higher seed then average the predicted probabilities.
+
+```{r}
+matchups <- list(
+  c("Duke", "Illinois"),
+  c("Illinois", "Duke"),
+  c("Arizona", "Michigan"),
+  c("Michigan", "Arizona")
+)
+
+cat("=== Semifinal Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_rf(m[1], m[2])))
+```
+
+#### Finals
+
+```{r}
+matchups <- list(
+  c("Duke", "Michigan"),
+  c("Michigan", "Duke")
+)
+
+cat("=== Final Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_rf(m[1], m[2])))
+```
+
+## Gradient Boosting Method Predictions (H48Hsd)
+```{r, results = 'hide'}
+modelgbm <- train(outcome ~badj_o_diff+badj_d_diff+wab_diff+talent_diff, 
+             data = model_df_clean, method = "gbm", metric = metric, 
+             trControl = trainControl, preProcess = c("center", "scale"))
+                  
+predict_game_gbm <- function(team1, team2) {
+  teams <- c(team1, team2)
+  game <- df_26 %>% filter(TEAM %in% teams)
+  game_df <- game[game$TEAM == team1, 2:5] - game[game$TEAM == team2, 2:5]
+  colnames(game_df) <- c("badj_o_diff", "badj_d_diff", "wab_diff", "talent_diff")
+  prob <- predict(modelgbm, newdata = game_df, type = "prob")[,2]
+  winner <- ifelse(prob > 0.5, team1, team2)
+  win_prob <- round(ifelse(prob > 0.5, prob, 1 - prob) * 100, 1)
+  cat(team1, "vs", team2, "-->", winner, "(", win_prob, "%)\n")
+}
+```
+#### Round 1
+```{r}
+matchups <- list(
+  c("Duke", "Siena"),
+  c("Ohio St.", "TCU"),
+  c("St. John's", "Northern Iowa"),
+  c("Kansas", "Cal Baptist"),
+  c("Louisville", "South Florida"),
+  c("Michigan St.", "North Dakota St."),
+  c("UCLA", "UCF"),
+  c("Connecticut", "Furman"),
+  c("Florida", "Prairie View A&M"),
+  c("Clemson", "Iowa"),
+  c("Vanderbilt", "McNeese St."),
+  c("Nebraska", "Troy"),
+  c("North Carolina", "VCU"),
+  c("Illinois", "Penn"),
+  c("Saint Mary's", "Texas A&M"),
+  c("Houston", "Idaho"),
+  c("Arizona", "LIU Brooklyn"),
+  c("Villanova", "Utah St."),
+  c("Wisconsin", "High Point"),
+  c("Arkansas", "Hawaii"),
+  c("BYU", "Texas"),
+  c("Gonzaga", "Kennesaw St."),
+  c("Miami FL", "Missouri"),
+  c("Purdue", "Queens"),
+  c("Michigan", "Howard"),
+  c("Georgia", "Saint Louis"),
+  c("Texas Tech", "Akron"),
+  c("Alabama", "Hofstra"),
+  c("Tennessee", "Miami OH"),
+  c("Virginia", "Wright St."),
+  c("Kentucky", "Santa Clara"),
+  c("Iowa St.", "Tennessee St.")
+  
+)
+
+cat("=== First Round Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_gbm(m[1], m[2])))
+```
+
+#### Round 2
+```{r}
+matchups <- list(
+  c("Duke", "TCU"),
+  c("Kansas", "St. John's"),
+  c("Michigan St.", "Louisville"),
+  c("Connecticut", "UCLA"),
+  c("Florida", "Clemson"),
+  c("Nebraska", "Vanderbilt"),
+  c("Illinois", "VCU"),
+  c("Houston", "Texas A&M"),
+  c("Arizona", "Villanova"),
+  c("Arkansas", "Wisconsin"),
+  c("Gonzaga", "BYU"),
+  c("Purdue", "Miami FL"),
+  c("Michigan", "Georgia"),
+  c("Alabama", "Texas Tech"),
+  c("Virginia", "Tennessee"),
+  c("Iowa St.", "Kentucky")
+)
+
+cat("=== Second Round Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_gbm(m[1], m[2])))
+```
+
+#### Sweet 16
+
+```{r}
+matchups <- list(
+  c("Duke", "St. John's"),
+  c("Connecticut", "Michigan St."),
+  c("Florida", "Vanderbilt"),
+  c("Houston", "Illinois"),
+  c("Arizona", "Arkansas"),
+  c("Purdue", "Gonzaga"),
+  c("Michigan", "Alabama"),
+  c("Iowa St.", "Tennessee")
+)
+
+cat("=== Sweet 16 Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_gbm(m[1], m[2])))
+```
+
+#### Elite 8
+
+```{r}
+matchups <- list(
+  c("Duke", "Connecticut"),
+  c("Florida", "Houston"),
+  c("Arizona", "Purdue"),
+  c("Michigan", "Virginia")
+)
+
+cat("=== Sweet 16 Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_gbm(m[1], m[2])))
+```
+
+#### Semi-Finals
+
+```{r}
+matchups <- list(
+  c("Duke", "Houston"),
+  c("Houston", "Duke"),
+  c("Arizona", "Michigan"),
+  c("Michigan", "Arizona")
+)
+
+cat("=== Semifinal Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_gbm(m[1], m[2])))
+```
+
+#### Finals
+
+```{r}
+matchups <- list(
+  c("Duke", "Michigan"),
+  c("Michigan", "Duke")
+)
+
+cat("=== Final Predictions ===\n\n")
+invisible(lapply(matchups, function(m) predict_game_gbm(m[1], m[2])))
+```
