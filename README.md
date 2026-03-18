@@ -1,4 +1,4 @@
-#### March Madness 2026
+# March Madness 2026
 
 This project is intended to take advantage of my office's bracket competition to help me learn more about ways to solve the classification type of problem. I used several supervised learning models to predict the outcome of the 2026 March Madness tournament.
 
