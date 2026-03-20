@@ -2,7 +2,9 @@
 title: "March Madness"
 author: "Payton Lyons"
 date: "2026-03-17"
-output: html_document
+output:
+  html_document: default
+  pdf_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -14,6 +16,7 @@ library(nnet)
 library(randomForest)
 library(gbm)
 library(pROC)
+library(corrplot)
 ```
 
 # Data Merging and Cleaning
@@ -44,7 +47,7 @@ games <- data.frame(
 )
 ```
 
-Now create a data frame that merges the match up information with the Barttorvik data.
+Now create a data frame that merges the match up information with the Barttorvik data. The way the models will operate is by using the difference of key variables to compute the probability of a team winning. In this case we will be consistent by subtracting the lower seed variables from that of the higher seed. So the model will operate on the difference of the variables to identify the outcome.
 
 ```{r,results='hide',message=FALSE,warning=FALSE}
 model_df <- games %>%
@@ -89,18 +92,47 @@ model_df_clean$outcome <- factor(model_df_clean$outcome, levels = c(0, 1), label
 
 ```
 
-# Logistic Regression
+The main variables I want to include in the full model are the differences in offensive efficiency, defensive efficiency, wins above bubble, strength of schedule, experience, talent, height and seeding.
+
+The only concern is that seeding might be correlated with some of the other variables, as that data is what the seeders use to determining the rankings going into the tournament.
+
+## Summary Statistics
+
 ```{r}
-model <- glm(outcome ~ badj_o_diff+badj_d_diff+wab_diff+elite_sos_diff+
-             exp_diff+talent_diff+eff_hgt_diff+seed_diff, data = model_df_train, 
+statistics_df <- model_df_clean %>%
+  dplyr::select(outcome,badj_o_diff,badj_d_diff,wab_diff,elite_sos_diff,
+             exp_diff,talent_diff,eff_hgt_diff,seed_diff)
+
+summary(statistics_df)
+```
+A few things of note, the first is that in the historical data the high seed wins 62.39% of the time. That seems like a really large number of upsets in the tournament. This could indicate that some more steps should be added to account for upset potential. another thing that is interesting is that lineups that the high seeds use are, on average, a bit taller than those of the smaller seeds.
+
+Now we can check the correlation plot to see if there is any multi-collinearity between variables.
+
+```{r}
+M <- cor(statistics_df %>% select(-outcome))
+corrplot(M,method = 'number')
+```
+
+In this case we have some room for concern for a couple of the variables. It makes sense to simply remove the seeding difference, as it has relatively high correlation across all of the other predictor variables. It also makes sense to only include either the wins above bubble, or the elite sos metric. In this case the elite sos metric is based on the strength of schedule, whereas the wins above bubble shows how many more wins the team gets than a typical team would. Since the wins above bubble metric contains more information about the team that will be included over the elite sos metric. The only other room for concern is the correlation between the wins above bubble and offensive efficiency metrics. I don't necessarily view this as an issue, I think the variables encompass different information that moves in the same direction, so both will be included.
+
+# Logistic Regression
+
+Now we can fit a logistic regression model with all of the variables of interest on data up to 2024. We can test the forecasting accuracy of the model on the 2025 March Madness tournament.
+
+```{r}
+model <- glm(outcome ~ badj_o_diff+badj_d_diff+wab_diff+
+             exp_diff+talent_diff+eff_hgt_diff, data = model_df_train, 
              family = binomial)
 summary(model)
 ```
 
+From this we see that both height and experience weren't significant in determining the outcome of the game, but talent, offensive/defensive efficiency and wins above bubble are. We can use this model to see how well it can predict the 2025 tournament.
+
 ```{r}
 predictions <- predict(model, newdata = model_df_test, type = "response")
 
-predicted_outcome <- ifelse(predictions > 0.45, "win", "loss")
+predicted_outcome <- ifelse(predictions > 0.5, "win", "loss")
 
 actual_outcome <- model_df_test$outcome
 
@@ -108,10 +140,13 @@ mean(predicted_outcome == actual_outcome)
 
 table(predicted = predicted_outcome, actual = actual_outcome)
 ```
+The model has a really solid testing accuracy already of 79.37%. From the above confusion matrix it appears that the model has a hard time predicting upsets, which makes sense since a lot of the metrics used in the model are considered when seeding the team.
+
+Now we can use backwards selection to narrow down some potential variables.
 
 ```{r,results = 'hide'}
-lmMod <- glm(outcome ~ badj_o_diff+badj_d_diff+wab_diff+elite_sos_diff+
-             exp_diff+talent_diff+eff_hgt_diff+seed_diff, data = model_df_train, 
+lmMod <- glm(outcome ~ badj_o_diff+badj_d_diff+wab_diff+
+             exp_diff+talent_diff+eff_hgt_diff, data = model_df_train, 
              family = binomial)
 selectedMod <- step(lmMod)
 ```
@@ -119,6 +154,8 @@ selectedMod <- step(lmMod)
 ```{r}
 summary(selectedMod)
 ```
+
+Here we see that backwards selection ended up identifying the model with offensive/defensive efficiency, wins above bubble and talent as the best model. But does it perform as well as the full model when predicting the 2025 tournament?
 
 ```{r}
 predictions_glm <- predict(selectedMod, newdata = model_df_test, type = "response")
@@ -131,6 +168,8 @@ mean(predicted_outcome_glm == actual_outcome)
 
 table(predicted = predicted_outcome_glm, actual = actual_outcome)
 ```
+
+It performs very similarly as the full model, so all of those extra variables were not adding much information that the model was using to predict the outcomes. We can also observe how good the model's predictions are in the following plot.
 
 ```{r}
 data.frame(probability = predictions_glm, outcome = model_df_test$outcome) %>%
@@ -145,6 +184,8 @@ data.frame(probability = predictions_glm, outcome = model_df_test$outcome) %>%
         plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
 ```
 
+It is also important to check the ROC curve to make sure the model is performing better than a random classifier.
+
 ```{r}
 roc_curve <- roc(as.numeric(model_df_test$outcome), predictions)
 
@@ -158,26 +199,7 @@ ggroc(roc_curve, color = "steelblue", linewidth = 1) +
         plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
 ```
 
-```{r}
-data.frame(probability = predictions, outcome = as.numeric(model_df_test$outcome) - 1) %>%
-  mutate(bin = cut(probability, breaks = seq(0, 1, by = 0.1))) %>%
-  group_by(bin) %>%
-  summarise(mean_pred = mean(probability),
-            mean_actual = mean(outcome),
-            n = n()) %>%
-  ggplot(aes(x = mean_pred, y = mean_actual)) +
-  geom_abline(linetype = "dashed", color = "grey50") +
-  geom_point(aes(size = n), color = "steelblue", alpha = 0.8) +
-  scale_size_continuous(range = c(2, 8)) +
-  labs(title = "Calibration Plot",
-       subtitle = "Points on diagonal = perfectly calibrated",
-       x = "Mean Predicted Probability",
-       y = "Actual Win Rate",
-       size = "Games") +
-  theme_bw() +
-  theme(plot.title = element_text(face = "bold", hjust = 0.5),
-        plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
-```
+The model looks pretty good, it is significantly better than a random classifier. An AUC value of 0.847 is solid, meaning that given random data that lead to a win the model will correctly identify a higher win probability than random data that lead to a loss 84.7% of the time. We can visualize the decisions the model makes based on offensive and defensive efficiency in the following figure.
 
 ```{r}
 grid <- expand.grid(
@@ -213,10 +235,12 @@ ggplot() +
         plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
 ```
 
+One thing that I found particularly interesting is that the model predicts games where the teams have a high defensive efficiency difference but a low offensive efficiency difference as a loss for the high seed. Obviously there are other factors playing a role in the model's decisions that aren't being visualized, but it just interesting to see. 
+
+I am curious to see how a K nearest neighbors algorithm would behave in this type of problem.
 
 # KNN Algorithm
 
-Plan is to test this with both home and neutral/away data.
 
 ```{r, results='hide'}
 trainControl <- trainControl(method="repeatedcv", number=20, repeats=3)
@@ -356,6 +380,7 @@ ggplot() +
 ```
 
 # Random Forest
+
 ```{r,results='hide'}
 fit.rf <- train(outcome~badj_o_diff+badj_d_diff+wab_diff+talent_diff, 
                 data = model_df_train, 
@@ -367,6 +392,7 @@ fit.rf <- train(outcome~badj_o_diff+badj_d_diff+wab_diff+talent_diff,
 prediction_rf <- predict(fit.rf, newdata = model_df_test)
 confusionMatrix(prediction_rf, model_df_test$outcome)
 ```
+
 ```{r}
 grid <- expand.grid(
   badj_o_diff = seq(min(model_df_test$badj_o_diff), 
@@ -399,6 +425,7 @@ ggplot() +
 ```
 
 # Gradient Boosting
+
 ```{r,results='hide'}
 fit.gbm <- train(outcome ~badj_o_diff+badj_d_diff+wab_diff+talent_diff, 
              data = model_df_train, method = "gbm", metric = metric, 
@@ -440,6 +467,7 @@ ggplot() +
   theme(plot.title = element_text(face = "bold", hjust = 0.5),
         plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
 ```
+
 # Summary and Model Selection
 
 Selected the reduced logistic regression to create tournament bracket.
@@ -457,6 +485,7 @@ df_26 <- away_neutral %>%
   filter(YEAR == 2026) %>%
   select(c("TEAM","BADJ.O","BADJ.D","WAB","TALENT"))
 ```
+
 ## Logistic Regression Predictions
 
 ```{r}
@@ -507,11 +536,14 @@ matchups <- list(
   
 )
 ```
+
 #### Round 1
+
 ```{r}
 cat("=== First Round Predictions ===\n\n")
 invisible(lapply(matchups, function(m) predict_game_lm(m[1], m[2])))
 ```
+
 #### Round 2
 
 ```{r}
@@ -583,6 +615,7 @@ matchups <- list(
 cat("=== Semifinal Predictions ===\n\n")
 invisible(lapply(matchups, function(m) predict_game_lm(m[1], m[2])))
 ```
+
 #### Finals
 
 ```{r}
@@ -596,6 +629,7 @@ invisible(lapply(matchups, function(m) predict_game_lm(m[1], m[2])))
 ```
 
 ## Random Forest Predictions (PnzvWL)
+
 ```{r, results = 'hide'}
 modelrf <- train(outcome~badj_o_diff+badj_d_diff+wab_diff+talent_diff, 
                 data = model_df_clean, 
@@ -613,7 +647,9 @@ predict_game_rf <- function(team1, team2) {
   cat(team1, "vs", team2, "-->", winner, "(", win_prob, "%)\n")
 }
 ```
+
 #### Round 1
+
 ```{r}
 matchups <- list(
   c("Duke", "Siena"),
@@ -654,7 +690,9 @@ matchups <- list(
 cat("=== First Round Predictions ===\n\n")
 invisible(lapply(matchups, function(m) predict_game_rf(m[1], m[2])))
 ```
+
 #### Round 2
+
 ```{r}
 matchups <- list(
   c("Duke", "Ohio St."),
@@ -678,6 +716,7 @@ matchups <- list(
 cat("=== Second Round Predictions ===\n\n")
 invisible(lapply(matchups, function(m) predict_game_rf(m[1], m[2])))
 ```
+
 #### Sweet 16
 
 ```{r}
@@ -711,6 +750,7 @@ invisible(lapply(matchups, function(m) predict_game_rf(m[1], m[2])))
 ```
 
 #### Semi-Finals
+
 Predict each game twice, one with each team being the higher seed then average the predicted probabilities.
 
 ```{r}
@@ -738,6 +778,7 @@ invisible(lapply(matchups, function(m) predict_game_rf(m[1], m[2])))
 ```
 
 ## Gradient Boosting Method Predictions (H48Hsd)
+
 ```{r, results = 'hide'}
 modelgbm <- train(outcome ~badj_o_diff+badj_d_diff+wab_diff+talent_diff, 
              data = model_df_clean, method = "gbm", metric = metric, 
@@ -754,7 +795,9 @@ predict_game_gbm <- function(team1, team2) {
   cat(team1, "vs", team2, "-->", winner, "(", win_prob, "%)\n")
 }
 ```
+
 #### Round 1
+
 ```{r}
 matchups <- list(
   c("Duke", "Siena"),
@@ -797,12 +840,13 @@ invisible(lapply(matchups, function(m) predict_game_gbm(m[1], m[2])))
 ```
 
 #### Round 2
+
 ```{r}
 matchups <- list(
   c("Duke", "TCU"),
   c("Kansas", "St. John's"),
   c("Michigan St.", "Louisville"),
-  c("Connecticut", "UCLA"),
+  c("Connecticut", "UCF"),
   c("Florida", "Clemson"),
   c("Nebraska", "Vanderbilt"),
   c("Illinois", "VCU"),
